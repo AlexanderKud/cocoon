@@ -151,7 +151,7 @@ td::Result<td::BufferSlice> validate_modify_completions_request(td::BufferSlice 
     } else if (false && name == "tools") {
     } else if (name == "top_logprobs") {
       if (!value.is_number_unsigned()) {
-        return td::Status::Error(ton::ErrorCode::protoviolation, "top_p must be a number");
+        return td::Status::Error(ton::ErrorCode::protoviolation, "top_logprobs must be a number");
       }
     } else if (name == "top_p") {
       if (!value.is_number()) {
