@@ -107,7 +107,8 @@ void ProxyInboundWorkerConnection::receive_compare_payment_ext_query(td::BufferS
   TRY_RESULT_PROMISE(promise, obj,
                      fetch_tl_object<cocoon_api::worker_extendedCompareBalanceWithProxy>(std::move(query), true));
 
-  promise.set_error(td::Status::Error("not implemented yet"));
+  LOG(WARNING) << "skipping extended tokens compare: not implemented yet";
+  promise.set_value(cocoon::create_serialize_tl_object<cocoon_api::worker_extendedCompareBalanceWithProxyResult>(0));
 }
 
 void ProxyInboundWorkerConnection::receive_handshake_finish_query(td::BufferSlice query,
