@@ -13,7 +13,7 @@ This repository contains all the necessary tools and documentation to both serve
 **For Workers:**
 offering GPUs for computation
 
-- **Download**: [Latest worker release](https://github.com/cocoon/cocoon-worker/releases/latest) – Ready-to-run TDX image and setup scripts
+- **Download**: [Latest worker release](https://ci.cocoon.org/cocoon-worker-release-latest.tar.xz) – Ready-to-run TDX image and setup scripts
 - **Setup Guide**: Instructions are included in the release archive ([preview here](scripts/dist-worker/README.md))
 
 **For Developers:**

@@ -23,7 +23,7 @@ You may also find the `./scripts/setup-gpu-vfio` script helpful to prepare your 
 1. Download the COCOON worker distribution:
    ```bash
    wget https://ci.cocoon.org/cocoon-worker-release-latest.tar.xz 
-   tar xzf cocoon-worker-release-latest.tar.xz 
+   tar xvf cocoon-worker-release-latest.tar.xz 
    cd cocoon-worker-release-latest
    ```
 
