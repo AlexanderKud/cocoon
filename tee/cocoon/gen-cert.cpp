@@ -107,8 +107,8 @@ int main(int argc, char **argv) {
     td::change_user(user).ensure();
   }
   
-  td::write_file(cert_path, cert_and_key.cert_pem()).ensure();
-  td::write_file(key_path, cert_and_key.key_pem()).ensure();
+  td::atomic_write_file(cert_path, cert_and_key.cert_pem()).ensure();
+  td::atomic_write_file(key_path, cert_and_key.key_pem()).ensure();
 
   return 0;
 }
