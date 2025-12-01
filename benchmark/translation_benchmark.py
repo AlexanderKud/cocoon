@@ -498,12 +498,10 @@ def print_stats(results: List[BenchmarkResult], elapsed_time: float, total_chunk
         print(f"    Input chars/s: {input_chars / elapsed_time:.0f}")
         
         print(f"\n  Latency:")
-        print(f"    Avg: {statistics.mean(durations):.2f}s | P50: {sorted_durations[p50_idx]:.2f}s | P90: {sorted_durations[p90_idx]:.2f}s | P99: {sorted_durations[p99_idx]:.2f}s")
-        if is_final:
-            print(f"    Median: {statistics.median(durations):.2f}s")
-            print(f"    Min: {min(durations):.2f}s | Max: {max(durations):.2f}s")
-            if len(durations) > 1:
-                print(f"    Std Dev: {statistics.stdev(durations):.2f}s")
+        print(f"    Min: {min(durations):.2f}s | Avg: {statistics.mean(durations):.2f}s | Max: {max(durations):.2f}s")
+        print(f"    P50: {sorted_durations[p50_idx]:.2f}s | P90: {sorted_durations[p90_idx]:.2f}s | P99: {sorted_durations[p99_idx]:.2f}s")
+        if is_final and len(durations) > 1:
+            print(f"    Std Dev: {statistics.stdev(durations):.2f}s")
         
         # Show pending time stats if available (QPS mode)
         if pending_times:
@@ -589,8 +587,13 @@ def main():
                         help='Target queries per second (required for --load-mode qps)')
     parser.add_argument('--query', type=str,
                         help='Single query text to translate repeatedly (use --max-chunks to limit)')
+    parser.add_argument('--query-file', type=str,
+                        help='Read query from file (use --max-chunks to limit repetitions)')
     
     args = parser.parse_args()
+    
+    if args.query and args.query_file:
+        parser.error('Cannot specify both --query and --query-file')
     
     if args.load_mode == 'qps' and args.qps is None:
         parser.error('--qps is required when --load-mode is qps')
@@ -598,13 +601,20 @@ def main():
     # Prepare chunks and target languages
     target_langs = None
     
-    if args.query:
-        # Use query from command line - create infinite list limited by max_chunks
+    if args.query or args.query_file:
+        # Use query from command line or file
+        if args.query_file:
+            with open(args.query_file, 'r', encoding='utf-8') as f:
+                query_text = f.read()
+            print(f"Using query from file: {args.query_file} (length: {len(query_text)} chars)")
+        else:
+            query_text = args.query
+            print(f"Using query from command line (length: {len(query_text)} chars)")
+        
         repeat_count = args.max_chunks if args.max_chunks else 1000000  # Default to 1M if not specified
-        print(f"Using query from command line (length: {len(args.query)} chars)")
         print(f"Repeating query {repeat_count} times (or until stopped)")
-        chunks = [args.query] * repeat_count
-        print(f"  Query length: {len(args.query)} chars")
+        chunks = [query_text] * repeat_count
+        print(f"  Query length: {len(query_text)} chars")
     elif args.log_file:
         print(f"Parsing queries from log file: {args.log_file}")
         queries = parse_log_file(args.log_file)
