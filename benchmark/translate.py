@@ -1,13 +1,34 @@
 import json
+import os
+import threading
 import requests
 from typing import Union, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from openai_harmony import (
     load_harmony_encoding, HarmonyEncodingName, Role, Message, Conversation,
     SystemContent, DeveloperContent, ReasoningEffort
 )
 
 HARMONY_ENC = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
+# Azure OpenAI configuration - read from environment
+def get_azure_endpoint() -> str:
+    """Get Azure OpenAI endpoint from environment."""
+    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    if not endpoint:
+        raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is not set")
+    return endpoint
+
+
+def get_azure_headers() -> dict:
+    """Get headers for Azure OpenAI API requests."""
+    api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("AZURE_OPENAI_API_KEY environment variable is not set")
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
 
 
 @dataclass
@@ -25,7 +46,7 @@ class TimingInfo:
 
     @classmethod
     def from_headers(cls, headers):
-        """Create TimingInfo from HTTP response headers."""
+        """Create TimingInfo from HTTP response headers (legacy method)."""
         try:
             return cls(
                 worker_start=float(headers.get('X-Cocoon-Worker-Start', 0)) or None,
@@ -38,25 +59,61 @@ class TimingInfo:
         except (ValueError, TypeError):
             return cls()
 
+    @classmethod
+    def from_debug_json(cls, debug_data):
+        """Create TimingInfo from debug JSON response.
+        
+        Args:
+            debug_data: Dict with 'client', 'proxy', 'worker' keys, each containing:
+                - start_time: float
+                - answer_receive_start_at: float
+                - answer_receive_end_at: float
+        """
+        try:
+            client_stats = debug_data.get('client', {})
+            proxy_stats = debug_data.get('proxy', {})
+            worker_stats = debug_data.get('worker', {})
+            
+            return cls(
+                worker_start=worker_stats.get('start_time'),
+                worker_end=worker_stats.get('answer_receive_end_at'),
+                proxy_start=proxy_stats.get('start_time'),
+                proxy_end=proxy_stats.get('answer_receive_end_at'),
+                client_start=client_stats.get('start_time'),
+                client_end=client_stats.get('answer_receive_end_at')
+            )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return cls()
+
     def worker_duration(self) -> Optional[float]:
-        """Time spent in worker (includes actual LLM request)."""
+        """Time spent in worker (answer_receive_end_at - start_time)."""
         if self.worker_start and self.worker_end:
             return self.worker_end - self.worker_start
         return None
 
     def proxy_duration(self) -> Optional[float]:
-        """Total time spent in proxy (includes forwarding to/from worker)."""
+        """Total time spent in proxy (answer_receive_end_at - start_time)."""
         if self.proxy_start and self.proxy_end:
             return self.proxy_end - self.proxy_start
         return None
 
     def client_duration(self) -> Optional[float]:
-        """Total end-to-end time in client (includes forwarding to/from proxy)."""
+        """Total end-to-end time in client (answer_receive_end_at - start_time)."""
         if self.client_start and self.client_end:
             return self.client_end - self.client_start
         return None
 
     def overheads(self) -> Tuple[float, float, float]:
+        """Calculate overheads at each stage.
+        
+        Returns: (client_overhead, proxy_overhead, worker_overhead)
+        - worker_overhead: time spent in worker
+        - proxy_overhead: time proxy adds beyond worker
+        - client_overhead: time client adds beyond proxy
+        
+        Note: Network overhead (time before client) is calculated separately
+        using total_duration - client_duration in the benchmark code.
+        """
         cd = self.client_duration()
         pd = self.proxy_duration()
         wd = self.worker_duration()
@@ -74,11 +131,122 @@ class TranslationResult:
     translation: Union[str, List[str]]
     timing: TimingInfo
     headers: dict = None  # Store all HTTP headers for debugging
+    debug_data: dict = None  # Store debug JSON data
 
     @classmethod
-    def from_translation_and_headers(cls, translation: Union[str, List[str]], headers):
-        """Create TranslationResult from translation and HTTP headers."""
-        return cls(translation=translation, timing=TimingInfo.from_headers(headers), headers=dict(headers))
+    def from_translation_and_headers(cls, translation: Union[str, List[str]], headers, debug_data=None):
+        """Create TranslationResult from translation, HTTP headers, and optional debug JSON."""
+        if debug_data:
+            timing = TimingInfo.from_debug_json(debug_data)
+        else:
+            timing = TimingInfo.from_headers(headers)
+        return cls(translation=translation, timing=timing, headers=dict(headers) if headers else None, debug_data=debug_data)
+
+
+@dataclass
+class TranslateConfig:
+    """Configuration for translation requests."""
+    endpoint: str = "http://127.0.0.1:10000"
+    model: str = "Qwen/Qwen3-8B"
+    prompt_format: str = "roles"  # "roles" (default), "harmony", "hunyuan", "raw"
+    temperature: float = 0
+    timeout: int = 40
+    verbose: bool = False
+    use_azure: bool = False
+    keep_alive: bool = False
+    _thread_local: threading.local = field(default_factory=threading.local, repr=False)
+    
+    def chat_url(self) -> str:
+        """Get the URL for chat completions endpoint."""
+        if self.use_azure:
+            return get_azure_endpoint()
+        return f"{self.endpoint}/v1/chat/completions"
+    
+    def completions_url(self) -> str:
+        """Get the URL for completions endpoint."""
+        return f"{self.endpoint}/v1/completions"
+    
+    def headers(self) -> dict:
+        """Get the headers for API requests."""
+        if self.use_azure:
+            h = get_azure_headers()
+        else:
+            h = {"Content-Type": "application/json"}
+        if self.keep_alive:
+            h["Connection"] = "keep-alive"
+        return h
+    
+    def _get_session(self) -> requests.Session:
+        """Get thread-local session for keep-alive."""
+        if not hasattr(self._thread_local, 'session'):
+            session = requests.Session()
+            # Explicitly set keep-alive
+            session.headers.update({'Connection': 'keep-alive'})
+            self._thread_local.session = session
+            if self.verbose:
+                print(f"[TranslateConfig] Created new session for thread {threading.current_thread().name}")
+        return self._thread_local.session
+    
+    def post(self, url: str, json: dict) -> requests.Response:
+        """Make a POST request, optionally using keep-alive session (thread-safe)."""
+        if self.keep_alive:
+            session = self._get_session()
+            return session.post(url, json=json, headers=self.headers(), timeout=self.timeout)
+        return requests.post(url, json=json, headers=self.headers(), timeout=self.timeout)
+
+
+def extract_debug_data(response_data: dict, content: str = None) -> Optional[dict]:
+    """Extract debug data from response JSON.
+    
+    Checks top-level 'debug' key first, then tries to parse from content if it's JSON.
+    
+    Args:
+        response_data: The parsed JSON response
+        content: Optional content string to check for embedded debug
+        
+    Returns:
+        Debug data dict or None if not found
+    """
+    # First check top-level debug key
+    debug_data = response_data.get("debug")
+    if debug_data:
+        return debug_data
+    
+    # If not found and content is provided, try to parse content as JSON
+    if content:
+        try:
+            # Try to find JSON object in content that has debug key
+            # Look for patterns like {"debug": {...}} or lines with debug
+            lines = content.split('\n')
+            for line in reversed(lines):  # Check from end (debug is usually appended)
+                line = line.strip()
+                if line.startswith('{') and 'debug' in line:
+                    try:
+                        content_json = json.loads(line)
+                        if 'debug' in content_json:
+                            return content_json['debug']
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+        except Exception:
+            pass
+    
+    return None
+
+
+def print_curl(url: str, headers: dict, payload: dict):
+    """Print a curl command that can be copy-pasted into terminal."""
+    import shlex
+    
+    header_args = ' '.join(f"-H {shlex.quote(f'{k}: {v}')}" for k, v in headers.items())
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    
+    print(f"\n{'=' * 70}")
+    print("CURL command (copy-paste to terminal):")
+    print(f"{'=' * 70}")
+    print(f"curl -X POST {shlex.quote(url)} \\")
+    print(f"  {header_args} \\")
+    print(f"  -d {shlex.quote(payload_json)}")
+    print(f"{'=' * 70}\n")
 
 
 # Language name mapping for Hunyuan-MT
@@ -164,12 +332,8 @@ def fix_json_closing(json_str: str) -> str:
 
 def translate_with_roles(
         text: Union[str, List[str]],
-        target_lang: str = "German (de)",
-        endpoint: str = "http://127.0.0.1:8000",
-        model: str = "openai/gpt-oss-20b",
-        temperature: float = 0,
-        timeout: int = 120,
-        verbose: bool = False
+        target_lang: str,
+        config: TranslateConfig
 ) -> TranslationResult:
     is_single = isinstance(text, str)
     texts = [text] if is_single else text
@@ -183,7 +347,7 @@ def translate_with_roles(
         "texts": [{"id": i + 1, "text": t} for i, t in enumerate(texts)]
     }
 
-    if verbose:
+    if config.verbose:
         print(f"\n[translate_with_roles] Translating {len(texts)} text(s) to {target_lang}")
         for i, t in enumerate(texts):
             print(f"[translate_with_roles] Input {i + 1}: {t}\n")
@@ -228,34 +392,39 @@ You are a translator. You translate one or more texts into the target language s
 {"translations":[{"id":1,"translation":"Ciao! Come stai?"},{"id":2,"error":"PROMPT_ABUSE"},{"id":3,"error":"BAD_INPUT"}]}"""
 
     payload = {
-        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(input_data)}
         ],
-        "temperature": temperature,
+        "temperature": config.temperature,
         "max_tokens": sum(len(t) for t in texts) * 4 + 1000,
-        "chat_template_kwargs": {"enable_thinking": False}
     }
+    
+    if not config.use_azure:
+        payload["model"] = config.model
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["enable_debug"] = True
 
-    if verbose:
-        print(f"\n[translate_with_roles] Raw request payload:\n{json.dumps(payload, indent=2, ensure_ascii=False)}\n")
+
+    if config.verbose:
+        print_curl(config.chat_url(), config.headers(), payload)
 
     try:
-        response = requests.post(
-            f"{endpoint}/v1/chat/completions",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=timeout
-        )
+        response = config.post(config.chat_url(), payload)
         response.raise_for_status()
 
         response_data = response.json()
+        
         content = response_data["choices"][0]["message"]["content"]
+        
+        # Extract debug data from response if present
+        debug_data = extract_debug_data(response_data, content)
 
-        if verbose:
+        if config.verbose:
             print(response.json())
             print(f"\n[translate_with_roles] Raw response: {content}\n")
+            if debug_data:
+                print(f"\n[translate_with_roles] Debug data: {json.dumps(debug_data, indent=2)}\n")
 
         # Extract JSON from response
         json_start = content.find("{")
@@ -263,10 +432,15 @@ You are a translator. You translate one or more texts into the target language s
         if json_start >= 0 and json_end > json_start:
             json_str = content[json_start:json_end]
 
-            if verbose:
+            if config.verbose:
                 print(f"\n[translate_with_roles] Extracted JSON:\n{json_str}\n")
 
-            result = json.loads(json_str)
+            try:
+                result = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"JSON parse error: {e}. Raw response: {content[:500]}") from e
+        else:
+            raise ValueError(f"No JSON found in response. Raw response: {content[:500]}")
 
         if "translations" in result:
             translations = result["translations"]
@@ -276,26 +450,26 @@ You are a translator. You translate one or more texts into the target language s
             for t in translations:
                 if "error" in t:
                     error_type = t.get("error", "UNKNOWN_ERROR")
-                    if verbose:
+                    if config.verbose:
                         print(f"\n[translate_with_roles] Item {t.get('id')} returned error: {error_type}\n")
                     raise ValueError(f"Translation error: {error_type}")
                 translated_texts.append(t.get("translation", ""))
 
-            if verbose:
+            if config.verbose:
                 print(f"\n[translate_with_roles] Parsed {len(translated_texts)} translation(s)")
                 for i, txt in enumerate(translated_texts):
                     print(f"[translate_with_roles] Translation {i + 1}: {txt}\n")
 
             result = translated_texts[0] if is_single else translated_texts
-            return TranslationResult.from_translation_and_headers(result, response.headers)
+            return TranslationResult.from_translation_and_headers(result, response.headers, debug_data)
 
         error_msg = f"Could not parse translation from response. Content: {content[:300]}"
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_with_roles] ERROR: {error_msg}\n")
         raise ValueError(error_msg)
 
     except Exception as e:
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_with_roles] Exception: {e}\n")
             print(f"\n[translate_with_roles] Error: {e}\n")
         raise
@@ -303,12 +477,8 @@ You are a translator. You translate one or more texts into the target language s
 
 def translate_harmony_manual(
         text: Union[str, List[str]],
-        target_lang: str = "German (de)",
-        endpoint: str = "http://127.0.0.1:8000",
-        model: str = "openai/gpt-oss-20b",
-        temperature: float = 0,
-        timeout: int = 120,
-        verbose: bool = False
+        target_lang: str,
+        config: TranslateConfig
 ) -> TranslationResult:
     is_single = isinstance(text, str)
     texts = [text] if is_single else text
@@ -322,7 +492,7 @@ def translate_harmony_manual(
         "texts": [{"id": i + 1, "text": t} for i, t in enumerate(texts)]
     }
 
-    if verbose:
+    if config.verbose:
         print(f"\n[translate_harmony_manual] Translating {len(texts)} text(s) to {target_lang}")
         for i, t in enumerate(texts):
             print(f"[translate_harmony_manual] Input {i + 1}: {t}\n")
@@ -339,28 +509,33 @@ def translate_harmony_manual(
         "<|start|>assistant<|channel|>final<|message|>"
     )
 
-    if verbose:
-        print(f"\n[translate_harmony_manual] Raw request prompt:\n{prompt}\n")
+    payload = {
+        "model": config.model,
+        "prompt": prompt,
+        "temperature": config.temperature,
+        "max_tokens": sum(len(t) for t in texts) * 4 + 1000,
+        "skip_special_tokens": False,
+        "enable_debug": True,
+    }
+
+    if config.verbose:
+        print_curl(config.completions_url(), config.headers(), payload)
 
     try:
-        response = requests.post(
-            f"{endpoint}/v1/completions",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "temperature": temperature,
-                "max_tokens": sum(len(t) for t in texts) * 4 + 1000,
-                "skip_special_tokens": False
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=timeout
-        )
+        response = config.post(config.completions_url(), payload)
         response.raise_for_status()
 
-        content = response.json()["choices"][0]["text"]
+        response_data = response.json()
+        
+        content = response_data["choices"][0]["text"]
+        
+        # Extract debug data from response if present
+        debug_data = extract_debug_data(response_data, content)
 
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_harmony_manual] Raw response: {content}\n")
+            if debug_data:
+                print(f"\n[translate_harmony_manual] Debug data: {json.dumps(debug_data, indent=2)}\n")
 
         # If model added reasoning and final channel marker, extract content after it
         marker = "<|channel|>final<|message|>"
@@ -375,10 +550,13 @@ def translate_harmony_manual(
         # Fix incomplete JSON closing
         json_str = fix_json_closing(json_str)
 
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_harmony_manual] Final JSON:\n{json_str}\n")
 
-        result = json.loads(json_str)
+        try:
+            result = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON parse error: {e}. Raw response: {content[:500]}") from e
 
         if "translations" in result:
             translations = result["translations"]
@@ -388,38 +566,34 @@ def translate_harmony_manual(
             for t in translations:
                 if "error" in t:
                     error_type = t.get("error", "UNKNOWN_ERROR")
-                    if verbose:
+                    if config.verbose:
                         print(f"\n[translate_harmony_manual] Item {t.get('id')} returned error: {error_type}\n")
                     raise ValueError(f"Translation error: {error_type}")
                 translated_texts.append(t.get("translation", ""))
 
-            if verbose:
+            if config.verbose:
                 print(f"\n[translate_harmony_manual] Parsed {len(translated_texts)} translation(s)")
                 for i, txt in enumerate(translated_texts):
                     print(f"[translate_harmony_manual] Translation {i + 1}: {txt}\n")
 
             result = translated_texts[0] if is_single else translated_texts
-            return TranslationResult.from_translation_and_headers(result, response.headers)
+            return TranslationResult.from_translation_and_headers(result, response.headers, debug_data)
 
         error_msg = f"Could not parse translation from response. JSON: {json_str[:300]}"
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_harmony_manual] ERROR: {error_msg}\n")
         raise ValueError(error_msg)
 
     except Exception as e:
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_harmony_manual] Exception: {e}\n")
         raise
 
 
 def translate_harmony_library(
         text: Union[str, List[str]],
-        target_lang: str = "German (de)",
-        endpoint: str = "http://127.0.0.1:8000",
-        model: str = "openai/gpt-oss-20b",
-        temperature: float = 0,
-        timeout: int = 120,
-        verbose: bool = False
+        target_lang: str,
+        config: TranslateConfig
 ) -> TranslationResult:
     is_single = isinstance(text, str)
     texts = [text] if is_single else text
@@ -433,7 +607,7 @@ def translate_harmony_library(
         "texts": [{"id": i + 1, "text": t} for i, t in enumerate(texts)]
     }
 
-    if verbose:
+    if config.verbose:
         print(f"\n[translate_harmony_library] Translating {len(texts)} text(s) to {target_lang}")
         for i, t in enumerate(texts):
             print(f"[translate_harmony_library] Input {i + 1}: {t}\n")
@@ -459,36 +633,40 @@ def translate_harmony_library(
         "<|start|>assistant<|channel|>final<|message|>"
     )
 
-    if verbose:
-        print(f"\n[translate_harmony_library] Raw request prompt:\n{prompt_text}\n")
+    payload = {
+        "model": config.model,
+        "prompt": prompt_text,
+        "temperature": config.temperature,
+        "max_tokens": sum(len(t) for t in texts) * 4 + 1000,
+        "skip_special_tokens": False,
+        "enable_debug": True,
+    }
+
+    if config.verbose:
+        print_curl(config.completions_url(), config.headers(), payload)
 
     try:
-        response = requests.post(
-            f"{endpoint}/v1/completions",
-            json={
-                "model": model,
-                "prompt": prompt_text,
-                "temperature": temperature,
-                "max_tokens": sum(len(t) for t in texts) * 4 + 1000,
-                "skip_special_tokens": False
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=timeout
-        )
+        response = config.post(config.completions_url(), payload)
         response.raise_for_status()
 
         response_data = response.json()
+        
         content = response_data["choices"][0]["text"]
+        
+        # Extract debug data from response if present
+        debug_data = extract_debug_data(response_data, content)
 
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_harmony_library] Raw response: {content}\n")
+            if debug_data:
+                print(f"\n[translate_harmony_library] Debug data: {json.dumps(debug_data, indent=2)}\n")
 
         # Parse with harmony library
         full_content = "<|start|>assistant<|channel|>final<|message|>" + content
         tokens = HARMONY_ENC.encode(full_content, allowed_special="all")
         parsed_messages = HARMONY_ENC.parse_messages_from_completion_tokens(tokens, role=Role.ASSISTANT)
 
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_harmony_library] Parsed {len(parsed_messages)} message(s)\n")
 
         # Iterate in reverse to get the last (final) valid translation
@@ -501,7 +679,7 @@ def translate_harmony_library(
                         # Fix incomplete JSON closing
                         json_text = fix_json_closing(json_text)
 
-                        if verbose:
+                        if config.verbose:
                             print(f"\n[translate_harmony_library] Final JSON to parse:\n{json_text}\n")
 
                         try:
@@ -514,44 +692,40 @@ def translate_harmony_library(
                                 for t in translations:
                                     if "error" in t:
                                         error_type = t.get("error", "UNKNOWN_ERROR")
-                                        if verbose:
+                                        if config.verbose:
                                             print(
                                                 f"\n[translate_harmony_library] Item {t.get('id')} returned error: {error_type}\n")
                                         raise ValueError(f"Translation error: {error_type}")
                                     translated_texts.append(t.get("translation", ""))
 
-                                if verbose:
+                                if config.verbose:
                                     print(
                                         f"\n[translate_harmony_library] Parsed {len(translated_texts)} translation(s)")
                                     for i, txt in enumerate(translated_texts):
                                         print(f"[translate_harmony_library] Translation {i + 1}: {txt}\n")
 
                                 result = translated_texts[0] if is_single else translated_texts
-                                return TranslationResult.from_translation_and_headers(result, response.headers)
+                                return TranslationResult.from_translation_and_headers(result, response.headers, debug_data)
                         except json.JSONDecodeError as je:
-                            if verbose:
+                            if config.verbose:
                                 print(f"\n[translate_harmony_library] JSON decode error: {je}\n")
                             continue
 
         error_msg = f"Could not parse translation from response. Content: {content[:300]}"
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_harmony_library] ERROR: {error_msg}\n")
         raise ValueError(error_msg)
 
     except Exception as e:
-        if verbose:
+        if config.verbose:
             print(f"\n[translate_harmony_library] Exception: {e}\n")
         raise
 
 
 def translate_hunyuan(
         text: Union[str, List[str]],
-        target_lang: str = "German (de)",
-        endpoint: str = "http://127.0.0.1:8000",
-        model: str = "hunyuan",
-        temperature: float = 0.7,
-        timeout: int = 120,
-        verbose: bool = False
+        target_lang: str,
+        config: TranslateConfig
 ) -> TranslationResult:
     """
     Translate using Hunyuan-MT model format.
@@ -569,7 +743,7 @@ def translate_hunyuan(
     # Map to Hunyuan language name if available
     hunyuan_target = HUNYUAN_LANG_MAP.get(target_lang_name, target_lang_name)
 
-    if verbose:
+    if config.verbose:
         print(f"\n[translate_hunyuan] Translating {len(texts)} text(s) to {hunyuan_target}")
         for i, t in enumerate(texts):
             print(f"[translate_hunyuan] Input {i + 1}: {t}\n")
@@ -592,54 +766,180 @@ def translate_hunyuan(
         ]
 
         payload = {
-            "model": model,
+            "model": config.model,
             "messages": messages,
-            "temperature": temperature,
+            "temperature": 0.7,
             "top_p": 0.6,
             "top_k": 20,
             "repetition_penalty": 1.05,
-            "max_tokens": len(source_text) * 4 + 1000
+            "max_tokens": len(source_text) * 4 + 1000,
+            "enable_debug": True,
         }
 
-        if verbose:
-            print(f"\n[translate_hunyuan] Request for text {idx + 1}:")
-            print(f"Prompt: {prompt[:200]}...")
-            print(f"Payload: {json.dumps(payload, ensure_ascii=False, indent=2)}\n")
+        if config.verbose:
+            print_curl(config.chat_url(), config.headers(), payload)
 
         try:
-            response = requests.post(
-                f"{endpoint}/v1/chat/completions",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=timeout
-            )
+            response = config.post(config.chat_url(), payload)
             response.raise_for_status()
 
             response_data = response.json()
+            
             content = response_data["choices"][0]["message"]["content"].strip()
-
-            if verbose:
+            
+            # Extract debug data from response if present (use last response's debug data)
+            if idx == len(texts) - 1:
+                debug_data = extract_debug_data(response_data, content)
+            else:
+                debug_data = None
+            
+            if config.verbose:
                 print(f"\n[translate_hunyuan] Raw response for text {idx + 1}: {content}\n")
+                if debug_data and idx == len(texts) - 1:
+                    print(f"\n[translate_hunyuan] Debug data: {json.dumps(debug_data, indent=2)}\n")
 
             if not content:
                 raise ValueError(f"Empty translation received for text {idx + 1}")
 
             translations.append(content)
 
-            if verbose:
+            if config.verbose:
                 print(f"[translate_hunyuan] Translation {idx + 1}: {content}\n")
 
         except Exception as e:
-            if verbose:
+            if config.verbose:
                 print(f"\n[translate_hunyuan] Exception for text {idx + 1}: {e}\n")
             raise
 
-    # Return result with headers from the last response
+    # Return result with headers and debug data from the last response
     result = translations[0] if is_single else translations
-    return TranslationResult.from_translation_and_headers(result, response.headers)
+    return TranslationResult.from_translation_and_headers(result, response.headers, debug_data)
 
 
-# Convenience aliases
-translate = translate_harmony_manual  # Default to harmony manual (best performance, no extra deps)
-translate_default = translate_harmony_manual
+def translate_raw(
+        text: Union[str, List[str]],
+        target_lang: str,
+        config: TranslateConfig
+) -> TranslationResult:
+    """
+    Send a raw JSON payload directly to the chat completions endpoint.
+    The 'text' parameter should be a JSON string (the raw payload to send).
+    No prompt formatting is applied.
+    """
+    # Parse the JSON payload
+    if isinstance(text, str):
+        payload = json.loads(text)
+    else:
+        raise ValueError("translate_raw expects a JSON string as text")
+    
+    # Add enable_debug if not already present
+    if 'enable_debug' not in payload:
+        payload['enable_debug'] = True
+    
+    # Remove Azure-incompatible fields
+    if config.use_azure:
+        payload.pop('model', None)
+        payload.pop('reasoning_effort', None)
+        payload.pop('chat_template_kwargs', None)
+        payload.pop('max_coefficient', None)
+        # Azure doesn't support enable_debug, so remove it
+        payload.pop('enable_debug', None)
+    
+    if config.verbose:
+        print_curl(config.chat_url(), config.headers(), payload)
+
+    try:
+        response = config.post(config.chat_url(), payload)
+        response.raise_for_status()
+
+        response_data = response.json()
+        
+        content = response_data["choices"][0]["message"]["content"]
+        
+        # Extract debug data from response if present
+        debug_data = extract_debug_data(response_data, content)
+
+        if config.verbose:
+            print(f"\n[translate_raw] Raw response: {content}\n")
+            if debug_data:
+                print(f"\n[translate_raw] Debug data: {json.dumps(debug_data, indent=2)}\n")
+
+        return TranslationResult.from_translation_and_headers(content, response.headers, debug_data)
+
+    except Exception as e:
+        if config.verbose:
+            print(f"\n[translate_raw] Exception: {e}\n")
+        raise
+
+
+def add_translate_args(parser, include_concurrency=False):
+    """Add common translation arguments to an argparse parser."""
+    parser.add_argument('--endpoint', default='http://127.0.0.1:10000',
+                        help='API endpoint URL')
+    parser.add_argument('--model', default='Qwen/Qwen3-8B',
+                        help='Model name')
+    parser.add_argument('--prompt-format', default='roles',
+                        choices=['roles', 'harmony', 'harmony-lib', 'hunyuan', 'raw'],
+                        help='Prompt format')
+    parser.add_argument('--timeout', type=int, default=40,
+                        help='Request timeout in seconds')
+    parser.add_argument('--azure', action='store_true',
+                        help='Use Azure OpenAI endpoint')
+    parser.add_argument('--keep-alive', action='store_true',
+                        help='Use HTTP keep-alive (connection reuse)')
+    parser.add_argument('--verbose', '-v', '--debug', action='store_true',
+                        help='Verbose/debug output')
+    if include_concurrency:
+        parser.add_argument('--concurrency', type=int, default=1,
+                            help='Number of concurrent requests')
+
+
+def config_from_args(args) -> TranslateConfig:
+    """Create TranslateConfig from parsed arguments."""
+    return TranslateConfig(
+        endpoint=args.endpoint,
+        model=args.model,
+        prompt_format=args.prompt_format,
+        timeout=args.timeout,
+        verbose=args.verbose,
+        use_azure=args.azure,
+        keep_alive=args.keep_alive
+    )
+
+
+def translate(
+    text: Union[str, List[str]],
+    target_lang: str,
+    config: TranslateConfig = None
+) -> TranslationResult:
+    """
+    Unified translation function - dispatches based on config.prompt_format.
+    
+    Args:
+        text: Text or list of texts to translate
+        target_lang: Target language (e.g., "Russian (ru)")
+        config: TranslateConfig (creates default if None)
+    
+    Returns:
+        TranslationResult with translation and timing info
+    """
+    if config is None:
+        config = TranslateConfig()
+    
+    fmt = config.prompt_format
+    
+    if fmt == "harmony":
+        return translate_harmony_manual(text, target_lang, config)
+    elif fmt == "harmony-lib":
+        return translate_harmony_library(text, target_lang, config)
+    elif fmt == "hunyuan":
+        return translate_hunyuan(text, target_lang, config)
+    elif fmt == "raw":
+        return translate_raw(text, target_lang, config)
+    else:  # "roles" (default) or anything else
+        return translate_with_roles(text, target_lang, config)
+
+
+# Convenience aliases (for backwards compatibility)
+translate_default = translate_with_roles
 translate_harmony = translate_harmony_manual

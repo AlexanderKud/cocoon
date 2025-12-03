@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
 import json
+import os
+import random
+import socket
 import time
 import urllib.request
 import statistics
@@ -10,15 +14,17 @@ import re
 import codecs
 import requests
 from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from translate import (
-    translate_with_roles,
-    translate_harmony_manual,
-    translate_harmony_library,
-    translate_hunyuan,
-    TimingInfo
+    translate,
+    add_translate_args,
+    config_from_args,
+    TimingInfo,
+    TranslateConfig
 )
 
 
@@ -125,37 +131,46 @@ def split_into_chunks(text: str, chunk_length: int, single_query: bool = False) 
 def calculate_timing_stats(results: List[BenchmarkResult]) -> Optional[dict]:
     """Calculate timing statistics from results with timing info.
     
-    Returns dict with worker_overheads, proxy_overheads, client_overheads
+    Returns dict with worker_overheads, proxy_overheads, client_overheads, network_overheads
     or None if no valid timing data.
     """
     results_with_timing = [r for r in results if r.timing]
-
+    
     if not results_with_timing:
         return None
-
+    
     worker_overheads = []
     proxy_overheads = []
     client_overheads = []
+    network_overheads = []
 
     for r in results_with_timing:
         client_oh, proxy_oh, worker_oh = r.timing.overheads()
-
+        
         if worker_oh > 0:
             worker_overheads.append(worker_oh)
         if proxy_oh > 0:
             proxy_overheads.append(proxy_oh)
         if client_oh > 0:
             client_overheads.append(client_oh)
-
+        
+        # Network overhead = total duration - client duration
+        cd = r.timing.client_duration()
+        if cd is not None and r.duration > 0:
+            net_oh = r.duration - cd
+            if net_oh > 0:
+                network_overheads.append(net_oh)
+    
     # Return None if we have no data at all
-    if not worker_overheads and not proxy_overheads and not client_overheads:
+    if not worker_overheads and not proxy_overheads and not client_overheads and not network_overheads:
         return None
-
+    
     return {
         'count': len(results_with_timing),
         'worker_overheads': worker_overheads,
         'proxy_overheads': proxy_overheads,
-        'client_overheads': client_overheads
+        'client_overheads': client_overheads,
+        'network_overheads': network_overheads
     }
 
 
@@ -169,9 +184,15 @@ def print_timing_breakdown(timing_stats: dict, prefix: str = ""):
     worker_overheads = timing_stats['worker_overheads']
     proxy_overheads = timing_stats['proxy_overheads']
     client_overheads = timing_stats['client_overheads']
+    network_overheads = timing_stats['network_overheads']
     count = timing_stats['count']
 
     print(f"{prefix}Timing Breakdown ({count} requests with timing headers):")
+
+    if network_overheads:
+        print(f"{prefix}  Network overhead: avg: {statistics.mean(network_overheads):.3f}s | "
+              f"median: {statistics.median(network_overheads):.3f}s | "
+              f"p90: {sorted(network_overheads)[int(len(network_overheads) * 0.90)]:.3f}s")
 
     if worker_overheads:
         print(f"{prefix}  Worker duration:  avg: {statistics.mean(worker_overheads):.3f}s | "
@@ -198,13 +219,9 @@ def print_timing_breakdown(timing_stats: dict, prefix: str = ""):
 def translate_chunk(
         chunk_id: int,
         chunk: str,
-        translate_func,
         target_lang: str,
-        endpoint: str,
-        model: str,
-        timeout: int,
+        config: TranslateConfig,
         start_time: float,
-        debug: bool = False,
         active_counter=None,
         submit_time: float = 0.0
 ) -> BenchmarkResult:
@@ -224,22 +241,15 @@ def translate_chunk(
             with active_counter['lock']:
                 active_counter['count'] += 1
 
-        # Call translate function with return_headers=True
-        result = translate_func(
-            chunk,
-            target_lang=target_lang,
-            endpoint=endpoint,
-            model=model,
-            timeout=timeout,
-            verbose=debug
-        )
+        # Call translate function
+        result = translate(chunk, target_lang=target_lang, config=config)
 
         # Extract translation and timing from TranslationResult
         translation = result.translation
         timing = result.timing
 
         # Debug: print all HTTP headers
-        if debug and result.headers:
+        if config.verbose and result.headers:
             print(f"\n[DEBUG] HTTP Headers for chunk {chunk_id}:")
             for key, value in result.headers.items():
                 print(f"  {key}: {value}")
@@ -276,7 +286,7 @@ def translate_chunk(
         error_str = str(e)
         timed_out = "timeout" in error_str.lower() or "timed out" in error_str.lower()
 
-        if debug:
+        if config.verbose:
             import traceback
             print(f"\n{'!' * 70}")
             print(f"DEBUG: Chunk {chunk_id} failed")
@@ -301,24 +311,20 @@ def translate_chunk(
 
 def run_benchmark(
         chunks: List[str],
-        endpoint: str,
-        model: str,
+        config: TranslateConfig,
         concurrency: int,
         target_lang: str,
-        prompt_format: str,
-        timeout: int,
         max_chunks: Optional[int] = None,
         stats_interval: int = 10,
-        debug: bool = False,
         target_langs: Optional[List[str]] = None,
         load_mode: str = "burst",
         qps: Optional[float] = None
 ) -> List[BenchmarkResult]:
     """Run the benchmark with specified concurrency using threads
-    
+
     If target_langs is provided, it should be a list with one target language per chunk.
     Otherwise, target_lang is used for all chunks.
-    
+
     Load modes:
     - burst: send all requests as fast as possible (default)
     - fixed: maintain fixed number of active requests (concurrency)
@@ -340,20 +346,10 @@ def run_benchmark(
     if load_mode == "qps" and qps is None:
         raise ValueError("qps must be specified when load_mode='qps'")
 
-    # Select translate function based on format
-    if prompt_format == "harmony":
-        translate_func = translate_harmony_manual
-    elif prompt_format == "harmony-lib":
-        translate_func = translate_harmony_library
-    elif prompt_format == "hunyuan":
-        translate_func = translate_hunyuan
-    else:  # default
-        translate_func = translate_with_roles
-
     print(f"\n{'=' * 70}")
     print(f"Starting benchmark:")
-    print(f"  Endpoint: {endpoint}")
-    print(f"  Model: {model}")
+    print(f"  Endpoint: {config.endpoint}" + (" (Azure)" if config.use_azure else ""))
+    print(f"  Model: {config.model}")
     if len(chunks) == 1:
         print(f"  Mode: Single query (entire file)")
         print(f"  Total characters: {len(chunks[0])}")
@@ -372,8 +368,8 @@ def run_benchmark(
         print(
             f"  Target languages: {len(unique_langs)} different ({', '.join(list(unique_langs)[:5])}{'...' if len(unique_langs) > 5 else ''})")
 
-    print(f"  Prompt format: {prompt_format}")
-    print(f"  Timeout: {timeout}s")
+    print(f"  Prompt format: {config.prompt_format}")
+    print(f"  Timeout: {config.timeout}s")
     if len(chunks) > 1:
         print(f"  Stats interval: every {stats_interval} requests")
     print(f"{'=' * 70}\n")
@@ -420,7 +416,7 @@ def run_benchmark(
         processing = get_processing()
         completed = get_completed()
         if use_submitted:
-            # QPS mode: 
+            # QPS mode:
             # - processing = currently executing (after sleep, doing actual work)
             # - queue = submitted to executor but not yet executing
             submitted = get_submitted()
@@ -434,12 +430,14 @@ def run_benchmark(
 
     def process_chunk(chunk_id, chunk, use_submitted=False, submit_time=0.0):
         """Process a single chunk"""
+        chunk = chunk.replace('RANDOM_SALT', str(random.randint(0, 999999)))
         chunk_target_lang = target_langs[chunk_id]
         chunk_len = len(chunk)
 
+
         print(f"[{chunk_id + 1}/{len(chunks)}] Processing chunk (length: {chunk_len}, target: {chunk_target_lang})...")
         result = translate_chunk(
-            chunk_id, chunk, translate_func, chunk_target_lang, endpoint, model, timeout, start_time, debug,
+            chunk_id, chunk, chunk_target_lang, config, start_time,
             active_counter, submit_time
         )
 
@@ -454,23 +452,30 @@ def run_benchmark(
         if result.timing:
             parts = []
             client_oh, proxy_oh, worker_oh = result.timing.overheads()
-
-            if worker_oh:
+            
+            # Calculate network overhead
+            cd = result.timing.client_duration()
+            if cd is not None and result.duration > 0:
+                net_oh = result.duration - cd
+                if net_oh > 0:
+                    parts.append(f"N:{net_oh:.3f}s")
+            
+            if worker_oh > 0:
                 parts.append(f"W:{worker_oh:.3f}s")
-            if proxy_oh:
+            if proxy_oh > 0:
                 parts.append(f"P:{proxy_oh:.3f}s")
-            if client_oh:
+            if client_oh > 0:
                 parts.append(f"C:{client_oh:.3f}s")
-
+            
             if parts:
                 timing_str = " | " + " ".join(parts)
-
+        
         if result.success:
-            if chunk_id < 3 or (chunk_id + 1) % 20 == 0:
+            if chunk_id < 3 or (chunk_id + 1) % 20 == 0 or True:
                 print(
                     f"[{chunk_id + 1}/{len(chunks)}] ✓ {result.duration:.2f}s{pending_str}{timing_str} | {chunk_len} chars | {speed:.0f} chars/s | active: {active} | queue: {queue_size}")
                 print(f"  Original: {chunk[:100]}...")
-                print(f"  Translation: {result.translation}")
+                print(f"  Translation to {chunk_target_lang}: {result.translation}")
                 print()
             else:
                 print(
@@ -479,7 +484,7 @@ def run_benchmark(
             timeout_marker = " [TIMEOUT]" if result.timed_out else ""
             print(
                 f"[{chunk_id + 1}/{len(chunks)}] ✗{timeout_marker} {result.duration:.2f}s{pending_str}{timing_str} | {chunk_len} chars | {speed:.0f} chars/s | active: {active} | queue: {queue_size} | {result.error}")
-            if debug:
+            if config.verbose:
                 print(f"  Chunk preview: {chunk[:200]}...")
 
         # Add result and check if we should print stats
@@ -522,8 +527,6 @@ def run_benchmark(
 
     elif load_mode == "qps":
         # QPS mode: emit requests at fixed rate with Poisson distribution
-        import random
-
         # Generate request times using exponential distribution (Poisson process)
         request_times = []
         current_time = 0
@@ -665,6 +668,9 @@ def print_stats(results: List[BenchmarkResult], elapsed_time: float, total_chunk
         recent_timing_stats = calculate_timing_stats(recent_successful)
         if recent_timing_stats:
             parts = []
+            if recent_timing_stats['network_overheads']:
+                net_avg = statistics.mean(recent_timing_stats['network_overheads'])
+                parts.append(f"Net: {net_avg:.3f}s")
             if recent_timing_stats['worker_overheads']:
                 worker_avg = statistics.mean(recent_timing_stats['worker_overheads'])
                 parts.append(f"Worker: {worker_avg:.3f}s")
@@ -674,10 +680,10 @@ def print_stats(results: List[BenchmarkResult], elapsed_time: float, total_chunk
             if recent_timing_stats['client_overheads']:
                 client_avg = statistics.mean(recent_timing_stats['client_overheads'])
                 parts.append(f"Client OH: {client_avg:.3f}s")
-
+            
             if parts:
                 print(f"    Timing ({recent_timing_stats['count']} with headers): {' | '.join(parts)}")
-
+    
     # Show error details only in final results
     if is_final and failed:
         print(f"\n  Errors:")
@@ -692,31 +698,108 @@ def print_stats(results: List[BenchmarkResult], elapsed_time: float, total_chunk
     print(f"{separator * 70}\n")
 
 
+def save_results_to_csv(
+        results: List[BenchmarkResult],
+        all_chunks: List[str],
+        target_langs: List[str],
+        model: str,
+        csv_path: str
+):
+    """Save benchmark results to CSV in the same format as the logging system."""
+    
+    hostname = socket.gethostname()
+    
+    # CSV columns matching the log format
+    fieldnames = [
+        'loc', 'model', 'account', 'date', 'microtime', 'dc_id', 'dlog_tag',
+        'layer', 'hostname', 'source', 'event', 'data', 'uldata', 'debug',
+        'time', 'uid', 'time_utc'
+    ]
+    
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for i, result in enumerate(results):
+            chunk_text = all_chunks[result.chunk_id]
+            target_lang = target_langs[result.chunk_id] if target_langs else 'unknown'
+            
+            # Calculate completion timestamp
+            completion_time = time.time() - (results[-1].completed_at - result.completed_at) if results else time.time()
+            
+            # Build debug JSON (the important performance data)
+            debug_data = {
+                'count': 1,
+                'target_lang': target_lang,
+                'input_bytes': len(chunk_text.encode('utf-8')),
+                'input_chars': len(chunk_text),
+                'model': model,
+                'account': 'benchmark',
+                'prompt_bytes': len(chunk_text.encode('utf-8')),
+                'prompt_chars': len(chunk_text),
+                'output_bytes': len(result.translation.encode('utf-8')) if result.translation else 0,
+                'output_chars': len(result.translation) if result.translation else 0,
+                'output_errors': 0 if result.success else 1,
+                'time_ms': int(result.duration * 1000)
+            }
+            
+            # Add error info if failed
+            if not result.success and result.error:
+                error_key = f'output_errors_{result.error[:50]}'
+                debug_data[error_key] = 1
+            
+            # Format date and time
+            dt = datetime.fromtimestamp(completion_time)
+            date_int = int(dt.strftime('%Y%m%d00'))  # YYYYMMDD00 format
+            time_utc = dt.strftime('%d %b %Y %H:%M:%S')
+            
+            row = {
+                'loc': 4,
+                'model': model,
+                'account': 'benchmark',
+                'date': date_int,
+                'microtime': f'{completion_time:.4f}',
+                'dc_id': 4,
+                'dlog_tag': random.randint(100000000, 999999999),
+                'layer': 1,
+                'hostname': hostname,
+                'source': 'benchmark',
+                'event': 'translate_speed_stats',
+                'data': '[]',
+                'uldata': '[]' if result.success else '',
+                'debug': json.dumps(debug_data),
+                'time': int(completion_time),
+                'uid': random.randint(1000000000, 9999999999),
+                'time_utc': time_utc
+            }
+            
+            writer.writerow(row)
+    
+    print(f"\nResults saved to: {csv_path}")
+    print(f"  Total rows: {len(results)}")
+    print(f"  Successful: {sum(1 for r in results if r.success)}")
+    print(f"  Failed: {sum(1 for r in results if not r.success)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Benchmark LLM translation endpoint')
-    parser.add_argument('--endpoint', default='http://127.0.0.1:8000',
-                        help='API endpoint URL')
-    parser.add_argument('--model', default='openai/gpt-oss-20b',
-                        help='Model name')
-    parser.add_argument('--chunk-length', type=int, default=300,
-                        help='Approximate length of each text chunk')
+    
+    # Common translation arguments (without concurrency - we have different default)
+    add_translate_args(parser, include_concurrency=False)
+    
+    # Benchmark-specific arguments
     parser.add_argument('--concurrency', type=int, default=60,
                         help='Number of concurrent requests (or max workers for QPS mode)')
+    parser.add_argument('--chunk-length', type=int, default=300,
+                        help='Approximate length of each text chunk')
     parser.add_argument('--target-lang', default='German (de)',
                         help='Target language for translation')
     parser.add_argument('--max-chunks', type=int,
                         help='Maximum number of chunks to process (for testing)')
-    parser.add_argument('--prompt-format', default='default',
-                        choices=['default', 'harmony-lib', 'harmony', 'hunyuan'],
-                        help='Prompt format: default (roles), harmony (manual), harmony-lib (library), hunyuan (Hunyuan-MT)')
-    parser.add_argument('--timeout', type=int, default=120,
-                        help='Timeout for each request in seconds')
     parser.add_argument('--single-query', action='store_true',
                         help='Translate entire file as single query instead of chunks')
     parser.add_argument('--stats-interval', type=int, default=10,
                         help='Print interim stats every N requests')
-    parser.add_argument('--debug', action='store_true',
-                        help='Enable debug output for failed requests')
     parser.add_argument('--log-file', type=str,
                         help='Parse queries from log file instead of War and Peace')
     parser.add_argument('--load-mode', default='fixed',
@@ -728,6 +811,8 @@ def main():
                         help='Single query text to translate repeatedly (use --max-chunks to limit)')
     parser.add_argument('--query-file', type=str,
                         help='Read query from file (use --max-chunks to limit repetitions)')
+    parser.add_argument('--csv', type=str,
+                        help='Save results to CSV file (same format as logging system)')
 
     args = parser.parse_args()
 
@@ -783,22 +868,35 @@ def main():
             print(f"  Average chunk length: {sum(chunk_lengths) / len(chunk_lengths):.0f} chars")
             print(f"  Total characters: {sum(chunk_lengths)}")
 
+    # Create config
+    config = config_from_args(args)
+
+    # Ensure target_langs is set for CSV output
+    if target_langs is None:
+        target_langs = [args.target_lang] * len(chunks)
+
     # Run benchmark
     results = run_benchmark(
         chunks=chunks,
-        endpoint=args.endpoint,
-        model=args.model,
+        config=config,
         concurrency=args.concurrency,
         target_lang=args.target_lang,
-        prompt_format=args.prompt_format,
-        timeout=args.timeout,
         max_chunks=args.max_chunks,
         stats_interval=args.stats_interval,
-        debug=args.debug,
         target_langs=target_langs,
         load_mode=args.load_mode,
         qps=args.qps
     )
+
+    # Save to CSV if requested
+    if args.csv:
+        save_results_to_csv(
+            results=results,
+            all_chunks=chunks[:len(results)],  # Only chunks that were processed
+            target_langs=target_langs[:len(results)],
+            model=args.model,
+            csv_path=args.csv
+        )
 
 
 if __name__ == "__main__":
