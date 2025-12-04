@@ -1243,6 +1243,34 @@ void ProxyRunner::receive_query(TcpClient::ConnectionId connection_id, td::Buffe
 
       promise.set_value(cocoon::create_serialize_tl_object<cocoon_api::client_workerTypes>(std::move(r)));
     } break;
+    case cocoon_api::client_getWorkerTypesV2::ID: {
+      auto conn = static_cast<ProxyInboundConnection *>(get_connection(connection_id));
+      if (!conn || conn->connection_type() != ProxyInboundConnection::ConnectionType::Client ||
+          !conn->handshake_is_completed()) {
+        return promise.set_error(td::Status::Error(ton::ErrorCode::protoviolation, "expected client connection"));
+      }
+      TRY_RESULT_PROMISE(promise, obj, fetch_tl_object<cocoon_api::client_getWorkerTypesV2>(std::move(query), true));
+
+      std::vector<ton::tl_object_ptr<cocoon_api::client_workerTypeV2>> r;
+      for (auto &x : models_) {
+        std::vector<ton::tl_object_ptr<cocoon_api::client_workerInstanceV2>> e;
+
+        for (auto &c : x.second.connections) {
+          if (c.second->is_disabled) {
+            continue;
+          }
+          e.push_back(ton::create_tl_object<cocoon_api::client_workerInstanceV2>(
+              /* flags */ 0, (td::int32)c.second->coefficient, c.second->running_queries(),
+              c.second->max_active_requests));
+        }
+
+        std::sort(e.begin(), e.end(), [](const auto &l, const auto &r) { return l->coefficient_ < r->coefficient_; });
+
+        r.push_back(ton::create_tl_object<cocoon_api::client_workerTypeV2>(x.second.model_base_name, std::move(e)));
+      }
+
+      promise.set_value(cocoon::create_serialize_tl_object<cocoon_api::client_workerTypesV2>(std::move(r)));
+    } break;
     default:
       LOG(ERROR) << "received proxy query with unknown magic " << td::format::as_hex(magic);
   }

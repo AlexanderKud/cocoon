@@ -200,6 +200,10 @@ client.refundRejected active_queries:long = client.Refund;
 client.workerType name:string active_workers:int coefficient_min:int coefficient_bucket50:int coefficient_max:int = client.WorkerType;
 client.workerTypes types:(vector client.workerType) = client.WorkerTypes;
 
+client.workerInstanceV2#3ea93d00 flags:# coefficient:int active_requests:int max_active_requests:int = client.WorkerInstanceV2;
+client.workerTypeV2 name:string workers:(vector client.workerInstanceV2) = client.WorkerTypeV2;
+client.workerTypesV2 types:(vector client.workerTypeV2) = client.WorkerTypesV2;
+
 client.paymentStatus signed_payment:proxy.SignedPayment db_tokens:long max_tokens:long = client.PaymentStatus;
 
 proxy.clientRequestPayment request_id:int256 signed_payment:proxy.SignedPayment db_tokens:long max_tokens:long request_tokens:long = proxy.WorkerRequestPayment;
@@ -217,6 +221,7 @@ client.requestRefund = client.Refund;
 client.updatePaymentStatus = client.PaymentStatus;
 
 client.getWorkerTypes = client.WorkerTypes;
+client.getWorkerTypesV2 = client.WorkerTypesV2;
 
 ---types---
 

@@ -56,42 +56,86 @@ void ClientRunner::run_get_models_request(
     return promise.set_error(td::Status::Error(ton::ErrorCode::notready, "no working proxy connections"));
   }
 
-  auto connection = get_connection(proxy_target->connection_id());
+  auto connection = static_cast<ClientProxyConnection *>(get_connection(proxy_target->connection_id()));
   if (!connection || !connection->is_ready()) {
     return promise.set_error(td::Status::Error(ton::ErrorCode::notready, "no working proxy connections (2)"));
   }
-  auto request = cocoon::create_serialize_tl_object<cocoon_api::client_getWorkerTypes>();
-  send_query_to_connection(
-      proxy_target->connection_id(), "request", std::move(request), td::Timestamp::in(10.0),
-      [promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
-        if (R.is_error()) {
-          ton::http::answer_error(ton::http::HttpStatusCode::status_gateway_timeout, "gateway timeout",
-                                  std::move(promise));
-          return;
-        }
 
-        auto b = R.move_as_ok();
-        auto obj = cocoon::fetch_tl_object<cocoon_api::client_workerTypes>(std::move(b), true).move_as_ok();
-        SimpleJsonSerializer jb;
-        jb.start_object();
-        jb.add_element("object", "list");
-        jb.start_array("data");
-        for (size_t i = 0; i < obj->types_.size(); i++) {
-          auto &e = obj->types_[i];
+  if (connection->proto_version() == 0) {
+    auto request = cocoon::create_serialize_tl_object<cocoon_api::client_getWorkerTypes>();
+    send_query_to_connection(
+        proxy_target->connection_id(), "request", std::move(request), td::Timestamp::in(10.0),
+        [promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+          if (R.is_error()) {
+            ton::http::answer_error(ton::http::HttpStatusCode::status_gateway_timeout, "gateway timeout",
+                                    std::move(promise));
+            return;
+          }
+
+          auto b = R.move_as_ok();
+          auto obj = cocoon::fetch_tl_object<cocoon_api::client_workerTypes>(std::move(b), true).move_as_ok();
+          SimpleJsonSerializer jb;
           jb.start_object();
-          jb.add_element("id", e->name_);
-          jb.add_element("object", "model");
-          jb.add_element("created", 0);
-          jb.add_element("owned_by", "?");
+          jb.add_element("object", "list");
+          jb.start_array("data");
+          for (size_t i = 0; i < obj->types_.size(); i++) {
+            auto &e = obj->types_[i];
+            jb.start_object();
+            jb.add_element("id", e->name_);
+            jb.add_element("object", "model");
+            jb.add_element("created", 0);
+            jb.add_element("owned_by", "?");
+            jb.stop_object();
+          }
+          jb.stop_array();
+          jb.add_element("object", "list");
           jb.stop_object();
-        }
-        jb.stop_array();
-        jb.add_element("object", "list");
-        jb.stop_object();
 
-        auto res = jb.as_cslice().str();
-        http_send_static_answer(std::move(res), std::move(promise));
-      });
+          auto res = jb.as_cslice().str();
+          http_send_static_answer(std::move(res), std::move(promise));
+        });
+  } else {
+    auto request = cocoon::create_serialize_tl_object<cocoon_api::client_getWorkerTypesV2>();
+    send_query_to_connection(
+        proxy_target->connection_id(), "request", std::move(request), td::Timestamp::in(10.0),
+        [self = this, promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+          if (R.is_error()) {
+            self->http_send_static_answer(R.move_as_error_prefix("got error: "), std::move(promise));
+            return;
+          }
+
+          auto b = R.move_as_ok();
+          auto obj = cocoon::fetch_tl_object<cocoon_api::client_workerTypesV2>(std::move(b), true).move_as_ok();
+          SimpleJsonSerializer jb;
+          jb.start_object();
+          jb.add_element("object", "list");
+          jb.start_array("data");
+          for (size_t i = 0; i < obj->types_.size(); i++) {
+            auto &e = obj->types_[i];
+            jb.start_object();
+            jb.add_element("id", e->name_);
+            jb.add_element("object", "model");
+            jb.add_element("created", 0);
+            jb.add_element("owned_by", "?");
+            jb.start_array("workers");
+            for (auto &w : e->workers_) {
+              jb.start_object();
+              jb.add_element("coefficient", w->coefficient_);
+              jb.add_element("running_requests", w->active_requests_);
+              jb.add_element("max_running_requests", w->max_active_requests_);
+              jb.stop_array();
+            }
+            jb.stop_array();
+            jb.stop_object();
+          }
+          jb.stop_array();
+          jb.add_element("object", "list");
+          jb.stop_object();
+
+          auto res = jb.as_cslice().str();
+          http_send_static_answer(std::move(res), std::move(promise));
+        });
+  }
 }
 
 void ClientRunner::finish_request(td::Bits256 request_id, std::shared_ptr<ClientProxyInfo> proxy) {
