@@ -180,8 +180,7 @@ td::UInt512 UserClaims::to_hash() const {
 std::string UserClaims::serialize() const {
   // TODO: proper serialization with structured format
   // For now, use a more efficient approach than string concatenation
-  auto key_slice = public_key.to_secure_string().as_slice();
-  return std::string(key_slice.data(), key_slice.size());
+  return public_key.to_secure_string().as_slice().str();
 }
 
 // (Removed string printers for attestation data)
